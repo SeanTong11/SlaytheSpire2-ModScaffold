@@ -108,6 +108,7 @@ $sysUvCmd = Get-Command uv -ErrorAction SilentlyContinue
 
 $sysDotnet10Sdk = $false
 $sysDotnet10Runtime = $false
+$sysDotnet9Sdk = $false
 $sysDotnet8Runtime = $false
 $sysDotnetRoot = ""
 $useSystemDotnet = $false
@@ -118,12 +119,14 @@ if ($sysDotnetCmd) {
     Write-Host "  - System .NET: $sysDotnetVer (at $($sysDotnetCmd.Source))"
     & $sysDotnetCmd --list-sdks 2>$null | ForEach-Object {
         if ($_ -match "10\.0") { $sysDotnet10Sdk = $true }
+        if ($_ -match "9\.0") { $sysDotnet9Sdk = $true }
     }
     & $sysDotnetCmd --list-runtimes 2>$null | ForEach-Object {
         if ($_ -match "10\.0") { $sysDotnet10Runtime = $true }
         if ($_ -match "8\.0") { $sysDotnet8Runtime = $true }
     }
     if ($sysDotnet10Sdk) { Write-Host "    SDK 10.0: found" } else { Write-Host "    SDK 10.0: missing" }
+    if ($sysDotnet9Sdk) { Write-Host "    SDK 9.0: found" } else { Write-Host "    SDK 9.0: missing" }
     if ($sysDotnet10Runtime) { Write-Host "    Runtime 10.0: found" } else { Write-Host "    Runtime 10.0: missing" }
     if ($sysDotnet8Runtime) { Write-Host "    Runtime 8.0: found" } else { Write-Host "    Runtime 8.0: missing" }
 } else {
@@ -151,19 +154,21 @@ if ($sysDotnet10Sdk -and $sysDotnet8Runtime) {
     Write-Host "  - Will use isolated .NET from tools/dotnet"
 }
 
-Write-Step 0 7 "Setting up .NET SDK (10.0) and runtime (8.0)..."
+Write-Step 0 7 "Setting up .NET SDK (10.0 + 9.0) and runtimes..."
 
 $env:DOTNET_ROOT = $DotnetDir
 $env:PATH = "$DotnetDir;$env:PATH"
 
 $dotnet10Installed = $false
 $dotnet10RuntimeInstalled = $false
+$dotnet9Installed = $false
 $dotnet8RuntimeInstalled = $false
 
 if ($useSystemDotnet) {
     Write-OK "- Using system .NET (at $DotnetDir)"
     $dotnet10Installed = $true
     $dotnet10RuntimeInstalled = $true
+    $dotnet9Installed = $true
     $dotnet8RuntimeInstalled = $true
 } elseif ((Test-Path (Join-Path $DotnetDir "dotnet.exe")) -and (Test-FileSize (Join-Path $DotnetDir "dotnet.exe") 100000)) {
     $dotnetTest = & "$DotnetDir\dotnet.exe" --version 2>$null
@@ -175,12 +180,13 @@ if ($useSystemDotnet) {
         }
         Write-Host "  - Checking isolated .NET runtimes..."
         & "$DotnetDir\dotnet.exe" --list-runtimes 2>$null | ForEach-Object {
-            if ($_ -match "10\.0" -and $_ -match "Microsoft.WindowsDesktopRuntime") {
-                $dotnet10RuntimeInstalled = $true
-            }
+            if ($_ -match "10\.0") { $dotnet10RuntimeInstalled = $true }
             if ($_ -match "8\.0") { $dotnet8RuntimeInstalled = $true }
         }
-        if ($dotnet10Installed) { Write-OK "- Isolated .NET 10.0 SDK found" }
+        if ($dotnet10Installed) {
+            $dotnet10RuntimeInstalled = $true  # SDK includes runtime
+            Write-OK "- Isolated .NET 10.0 SDK found"
+        }
     } else {
         Write-Host "  - dotnet.exe exists but not working, will reinstall"
     }
@@ -289,6 +295,57 @@ if (-not $dotnet8RuntimeInstalled) {
     }
 } else {
     Write-OK "- .NET 8.0 runtime already installed"
+}
+
+# .NET 9 SDK is required by ILSpy MCP, STS2MCP, and STS2MenuControl (all target net9.0)
+if (-not $dotnet9Installed) {
+    Write-Host "  - Checking for .NET 9.0 SDK..."
+    & "$DotnetDir\dotnet.exe" --list-sdks 2>$null | ForEach-Object {
+        if ($_ -match "9\.0") { $dotnet9Installed = $true }
+    }
+}
+if (-not $dotnet9Installed) {
+    Write-Host "  - Installing .NET 9.0 SDK (required for ILSpy MCP / STS2MCP / STS2MenuControl)..."
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $installScript = Join-Path $env:TEMP "dotnet-install.ps1"
+        if (-not (Test-Path $installScript)) {
+            Invoke-WebRequest -Uri "https://dot.net/v1/dotnet-install.ps1" -OutFile $installScript -UseBasicParsing
+        }
+        $dotnetTempDir = Join-Path $env:TEMP "dotnet_temp_sdk9"
+        if (Test-Path $dotnetTempDir) { Remove-Item $dotnetTempDir -Recurse -Force -ErrorAction SilentlyContinue }
+        & $installScript -InstallDir $dotnetTempDir -Channel 9.0 -Version Latest 2>$null
+        if (Test-Path (Join-Path $dotnetTempDir "dotnet.exe")) {
+            robocopy $dotnetTempDir $DotnetDir /E /NFL /NDL /NJH /NJS /NC /NS 2>$null
+        }
+        $dotnet9Installed = & "$DotnetDir\dotnet.exe" --list-sdks 2>$null | Where-Object { $_ -match "9\.0" }
+        if (-not $dotnet9Installed) { throw "SDK install verification failed" }
+        Write-OK "- .NET 9.0 SDK installed"
+        Remove-Item $dotnetTempDir -Recurse -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Err ".NET 9.0 SDK installation failed: $_"
+        Write-Warn "ILSpy MCP, STS2MCP, and STS2MenuControl may fail to build. Install manually: winget install Microsoft.DotNet.SDK.9"
+    }
+} else {
+    Write-OK "- .NET 9.0 SDK already installed"
+}
+
+# Ensure NuGet package source is configured (robocopy merges may lose default config)
+$nugetConfigPath = Join-Path $ProjectDir "NuGet.Config"
+if (-not (Test-Path $nugetConfigPath)) {
+    Write-Host "  - Writing NuGet.Config (nuget.org source)..."
+@"
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <clear />
+    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+  </packageSources>
+</configuration>
+"@ | Set-Content -Path $nugetConfigPath -Encoding UTF8
+    Write-OK "- NuGet.Config created"
+} else {
+    Write-OK "- NuGet.Config already exists"
 }
 
 Write-OK "Done (.NET all runtimes ready)"
